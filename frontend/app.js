@@ -1,7 +1,7 @@
 'use strict';
 /* Harness Optimization Engine — single-page frontend (vanilla JS, hash routing). */
 
-const S = { agent: 'billing', boot: null, timers: [], query: new URLSearchParams(), jobs: {} };
+const S = { agent: 'billing', boot: null, timers: [], query: new URLSearchParams(), jobs: {}, health: null, healthTimer: null };
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -11,6 +11,12 @@ const num = v => v == null ? '—' : Math.round(v).toLocaleString('en-US');
 const fx = (v, d = 2) => v == null ? '—' : Number(v).toFixed(d);
 const sign = (v, d = 0) => (v >= 0 ? '+' : '−') + Math.abs(v).toFixed(d);
 const cls = v => v > 0 ? 'pos' : v < 0 ? 'neg' : '';
+const fmtTs = v => {
+  if (!v) return '—';
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return esc(String(v));
+  return d.toLocaleString();
+};
 
 async function api(path, opts = {}) {
   const r = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
@@ -67,6 +73,42 @@ const WARN = ['Waiting', 'Awaiting approval', 'Fix in approval', 'Rolling out', 
 const BAD = ['Rejected', 'Rolled back', 'Below threshold', 'failed', 'cancelled'];
 const status = s => `<span class="badge ${GOOD.includes(s) ? 'good' : WARN.includes(s) ? 'warn' : BAD.includes(s) ? 'bad' : 'info'}">${esc(s)}</span>`;
 const empty = (msg, action = '') => `<div class="empty">${msg}${action ? `<div style="margin-top:12px">${action}</div>` : ''}</div>`;
+
+function renderHealthPanel() {
+  const root = $('#startup-health');
+  if (!root) return;
+  const h = S.health;
+  if (!h) { root.innerHTML = ''; return; }
+  const slm = h.slm || {};
+  const run = h.run || null;
+  const fallback = h.fallback || 'disabled';
+  const runDone = run?.finished_at || run?.started_at || null;
+  root.innerHTML = `<div class="health-grid">
+    <div class="health-card"><div class="health-title">SLM runtime</div><div class="health-v">${slm.ready ? 'Local llama.cpp ready' : 'Local runtime unavailable'}</div>
+      <div class="small muted">${esc((slm.probe || slm.url || '127.0.0.1:8080'))}</div><div class="health-ts">Refreshed ${fmtTs(h.refreshed_at)}</div></div>
+    <div class="health-card"><div class="health-title">Fallback</div><div class="health-v">${esc(fallback)}</div>
+      <div class="small muted">Used only when local clustering fails</div></div>
+    <div class="health-card"><div class="health-title">Last ingest run</div><div class="health-v">${run ? `${run.status || 'ok'} · ${num(run.traces || 0)} traces` : 'No ingest run yet'}</div>
+      <div class="small muted">${run ? `quarantine ${num(run.line_quarantined || 0)} · parse errors ${num(run.parse_errors || 0)}` : 'Run /api/ingest/run to initialize'}</div>
+      <div class="health-ts">Completed ${fmtTs(runDone)}</div></div>
+  </div>`;
+}
+
+async function refreshHealthPanel() {
+  try {
+    const [slm, runs] = await Promise.all([api('/api/slm/status'), api('/api/ingest/runs?limit=1')]);
+    const cfg = S.boot?.settings || {};
+    S.health = {
+      slm: { ready: !!slm.probe?.ready, url: cfg.llama_server_url || 'http://127.0.0.1:8080', probe: slm.probe?.url || cfg.llama_server_url },
+      fallback: cfg.semantic_fallback_enabled ? `Anthropic: ${cfg.anthropic_fallback_model || 'haiku'}` : 'disabled',
+      run: runs.items?.[0] || null,
+      refreshed_at: new Date().toISOString(),
+    };
+  } catch (e) {
+    S.health = { slm: { ready: false }, fallback: 'unknown', run: null, refreshed_at: new Date().toISOString() };
+  }
+  renderHealthPanel();
+}
 
 function observeOnly(a) {
   return `<div class="panel">${empty(`${esc(a.name)} is connected as <b>${esc(a.integration.toLowerCase())}</b>. This demo simulates traces for the billing and outage agents only. Pick one of them from the agent menu, or test a proven pattern against this agent from the <a href="#/patterns">pattern library</a>.`)}</div>`;
@@ -240,11 +282,18 @@ function replayWidget(id, opts) {
 }
 
 /* ================================================================== views */
-const RANGES = [['24h', 'Last 24h'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['custom', 'Custom']];
+const RANGES = [['24h', 'Last 24h'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['90d', 'Last 90 days'], ['12m', 'Last 12 months'], ['custom', 'Custom']];
 function overviewQuery() {
   const q = S.query, r = q.get('range') || S.ovRange?.range || '7d';
   const from = q.get('from') || S.ovRange?.from || '', to = q.get('to') || S.ovRange?.to || '';
   S.ovRange = { range: r, from, to };
+  return r === 'custom' && from && to ? `range=custom&start=${from}&end=${to}` : `range=${r === 'custom' ? '7d' : r}`;
+}
+
+function ingestQuery() {
+  const q = S.query, r = q.get('range') || S.ingRange?.range || '7d';
+  const from = q.get('from') || S.ingRange?.from || '', to = q.get('to') || S.ingRange?.to || '';
+  S.ingRange = { range: r, from, to };
   return r === 'custom' && from && to ? `range=custom&start=${from}&end=${to}` : `range=${r === 'custom' ? '7d' : r}`;
 }
 
@@ -300,6 +349,163 @@ async function vOverview() {
         <span class="k">Gates</span><span>${d.production.gates.length ? d.production.gates.map(g => esc(S.boot.library.gates[g].text)).join('<br>') : 'None'}</span></div>
         <ul class="small" style="padding-left:18px;margin:12px 0 0">${d.production.lines.map(l => `<li>${esc(S.boot.library.lines[l].text)}${S.boot.library.lines[l].frozen ? ' <span class="lock">frozen</span>' : ''}</li>`).join('')}</ul></div>
     </div></div>`);
+}
+
+function ingestFilters(d, mirrorLabel) {
+  const w = d.window || {}, r = S.ingRange?.range || '7d', custom = r === 'custom';
+  return `<div class="ov-filters">
+    <label class="ov-field"><span>Mirror target <span class="cmp-tag">New traces</span></span><select disabled><option>${esc(mirrorLabel)}</option></select></label>
+    <div class="ov-field"><span id="itl">Ingested trace window</span>
+      <div class="seg ov-seg" role="group" aria-labelledby="itl">${RANGES.map(([k, l]) => `<button type="button" class="${k === r ? 'on' : ''}" aria-pressed="${k === r}" data-act="irange" data-r="${k}">${l}</button>`).join('')}</div>
+      ${custom ? `<div class="ov-custom"><input type="date" id="ifrom" value="${S.ingRange.from || w.start || ''}" aria-label="From">
+        <span class="faint">to</span><input type="date" id="ito" value="${S.ingRange.to || w.end || ''}" aria-label="To">
+        <button class="btn sm" data-act="iapply">Apply</button></div>` : ''}</div>
+  </div>`;
+}
+
+function mirrorShell(section, label, ing) {
+  return head(`${esc(label)} · New Trace Mirror`, `Specialized mirror tab using persisted ingestion KPI payload for comparison.`, `${ingestFilters(ing, label)}<a class="btn" href="#/${section}">Open original tab</a>`);
+}
+
+function mirrorCommonKpis(ing, old) {
+  const n = ing.summary || {};
+  const o = old?.kpis || {};
+  const dfail = o.flag_rate == null || n.failure_rate == null ? '—' : pts(n.failure_rate - o.flag_rate, 2);
+  const dlat = o.p95 == null || n.trace_p95_latency_sec == null ? '—' : `${sign(n.trace_p95_latency_sec - o.p95, 2)} s`;
+  return kpis([
+    { v: num(n.total_traces), l: 'Ingested traces', d: ing.window ? `${ing.window.start} to ${ing.window.end}` : '' },
+    { v: pct(n.failure_rate), l: 'Failure rate (new traces)', d: `vs original ${dfail}` },
+    { v: n.trace_p95_latency_sec == null ? '—' : `${fx(n.trace_p95_latency_sec, 2)} s`, l: 'Trace P95 latency', d: `vs original ${dlat}` },
+    { v: n.cost_per_eval_run == null ? '—' : fx(n.cost_per_eval_run, 4), l: 'Cost per eval run', d: 'metric-cost fields only' },
+  ]);
+}
+
+function renderMirrorThemes(section, label, ing, old, themes) {
+  const rows = (ing.failure_buckets || []).filter(r => r.bucket !== 'Pass');
+  const top = rows[0];
+  return `${mirrorShell(section, label, ing)}
+    ${mirrorCommonKpis(ing, old)}
+    <div class="grid-main"><div>
+      <div class="panel"><div class="panel-head"><h2>Ingested failure clusters</h2><span class="small muted">Bucket-level equivalents for theme drift</span></div>
+        <table><tr><th>Bucket</th><th class="num">Count</th><th class="num">Rate</th></tr>
+          ${rows.map(r => `<tr><td>${esc(r.bucket)}</td><td class="num">${num(r.count)}</td><td class="num">${pct(r.rate, 2)}</td></tr>`).join('') || `<tr><td colspan="3" class="muted">No failing buckets in selected window.</td></tr>`}
+        </table></div>
+      <div class="panel"><div class="panel-head"><h2>Daily failure trend</h2><span class="small muted">New traces only</span></div>
+        ${lineChart({ series: [{ name: 'Failure rate', color: '#EE0000', values: (ing.daily || []).map(x => x.failure_rate), dots: true }], labels: (ing.daily || []).map(x => x.event_date || ''), yMin: 0, yMax: 1 })}
+      </div>
+    </div><div>
+      <div class="panel"><h2>Theme comparison snapshot</h2><div class="kv">
+        <span class="k">Original theme count</span><span>${num(themes?.length || 0)}</span>
+        <span class="k">Top ingested failure</span><span>${top ? `${esc(top.bucket)} (${pct(top.rate, 1)})` : '—'}</span>
+        <span class="k">Open original themes</span><span><a href="#/themes">View source themes</a></span>
+      </div></div>
+    </div></div>`;
+}
+
+function renderMirrorFixes(section, label, ing, old, bundles) {
+  const failing = (ing.failure_buckets || []).filter(r => r.bucket !== 'Pass');
+  const prioritized = failing.slice(0, 5);
+  return `${mirrorShell(section, label, ing)}
+    ${mirrorCommonKpis(ing, old)}
+    <div class="grid-main"><div>
+      <div class="panel"><div class="panel-head"><h2>New-trace fix priorities</h2><span class="small muted">Prioritized by ingest failure volume</span></div>
+        <table><tr><th>Priority failure bucket</th><th class="num">Count</th><th class="num">Rate</th><th>Action</th></tr>
+          ${prioritized.map((r, i) => `<tr><td>${i + 1}. ${esc(r.bucket)}</td><td class="num">${num(r.count)}</td><td class="num">${pct(r.rate, 2)}</td><td><a href="#/fixes">Review candidate bundles</a></td></tr>`).join('') || `<tr><td colspan="4" class="muted">No failing buckets in selected window.</td></tr>`}
+        </table></div>
+      <div class="panel"><div class="panel-head"><h2>Daily failure trend</h2><span class="small muted">New traces only</span></div>
+        ${lineChart({ series: [{ name: 'Failure rate', color: '#EE0000', values: (ing.daily || []).map(x => x.failure_rate), dots: true }], labels: (ing.daily || []).map(x => x.event_date || ''), yMin: 0, yMax: 1 })}
+      </div>
+    </div><div>
+      <div class="panel"><h2>Original fix inventory</h2><div class="kv">
+        <span class="k">Bundles</span><span>${num(bundles?.length || 0)}</span>
+        <span class="k">Candidate fixes</span><span>${num((bundles || []).reduce((s, b) => s + (b.fixes?.length || 0), 0))}</span>
+        <span class="k">Open fix tab</span><span><a href="#/fixes">Fix bundles</a></span>
+      </div></div>
+    </div></div>`;
+}
+
+function renderMirrorJudges(section, label, ing, old, judges) {
+  const n = ing.summary || {};
+  return `${mirrorShell(section, label, ing)}
+    ${mirrorCommonKpis(ing, old)}
+    <div class="grid-main"><div>
+      <div class="panel"><h2>Judge-risk signals from ingested traces</h2>
+        <table><tr><th>Signal</th><th class="num">Observed</th><th>Interpretation</th></tr>
+          <tr><td>Failure rate</td><td class="num">${pct(n.failure_rate, 2)}</td><td class="small">High failure volume increases chance of judge disagreement hotspots.</td></tr>
+          <tr><td>Policy violation incidence</td><td class="num">${n.policy_violation_incidence == null ? '—' : pct(n.policy_violation_incidence, 2)}</td><td class="small">Higher policy violations indicate stricter fail conditions for resolution judges.</td></tr>
+          <tr><td>Retry/escalation rate</td><td class="num">${n.retry_escalation_rate == null ? '—' : pct(n.retry_escalation_rate, 2)}</td><td class="small">Escalations often correlate with harder sessions for judge calibration.</td></tr>
+        </table></div>
+      <div class="panel"><div class="panel-head"><h2>Daily failure trend</h2><span class="small muted">New traces only</span></div>
+        ${lineChart({ series: [{ name: 'Failure rate', color: '#EE0000', values: (ing.daily || []).map(x => x.failure_rate), dots: true }], labels: (ing.daily || []).map(x => x.event_date || ''), yMin: 0, yMax: 1 })}
+      </div>
+    </div><div>
+      <div class="panel"><h2>Current judge baseline</h2><div class="kv">
+        <span class="k">Resolution κ</span><span>${judges?.kappa == null ? '—' : fx(judges.kappa, 3)}</span>
+        <span class="k">Threshold</span><span>${judges?.threshold == null ? '—' : fx(judges.threshold, 3)}</span>
+        <span class="k">Status</span><span>${judges?.kappa != null && judges.threshold != null && judges.kappa >= judges.threshold ? '<span class="badge good">Healthy</span>' : '<span class="badge warn">Check</span>'}</span>
+        <span class="k">Deep-dive tab</span><span><a href="#/judges">Open original judges view</a></span>
+      </div></div>
+    </div></div>`;
+}
+
+function renderMirrorGeneric(section, label, ing, old) {
+  const rows = ing.failure_buckets || [];
+  const n = ing.summary || {};
+  return `${mirrorShell(section, label, ing)}
+    ${mirrorCommonKpis(ing, old)}
+    <div class="grid-main"><div>
+      <div class="panel"><div class="panel-head"><h2>Failure-bucket distribution</h2><span class="small muted">Ingestion pipeline aggregate</span></div>
+        <table><tr><th>Bucket</th><th class="num">Count</th><th class="num">Rate</th></tr>
+          ${rows.map(r => `<tr><td>${esc(r.bucket)}</td><td class="num">${num(r.count)}</td><td class="num">${pct(r.rate, 2)}</td></tr>`).join('') || `<tr><td colspan="3" class="muted">No rows in selected window.</td></tr>`}
+        </table></div>
+      <div class="panel"><div class="panel-head"><h2>Daily failure trend</h2><span class="small muted">New traces only</span></div>
+        ${lineChart({ series: [{ name: 'Failure rate', color: '#EE0000', values: (ing.daily || []).map(x => x.failure_rate), dots: true }], labels: (ing.daily || []).map(x => x.event_date || ''), yMin: 0, yMax: 1 })}
+      </div>
+    </div><div>
+      <div class="panel"><h2>Operational snapshot</h2><div class="kv">
+        <span class="k">Retry or escalation</span><span>${n.retry_escalation_rate == null ? '—' : pct(n.retry_escalation_rate, 2)}</span>
+        <span class="k">Policy-violation incidence</span><span>${n.policy_violation_incidence == null ? '—' : pct(n.policy_violation_incidence, 2)}</span>
+        <span class="k">Source mode</span><span>Persisted ingestion DB</span>
+      </div></div>
+      <div class="panel"><h2>Comparison guidance</h2><p class="small muted">Use this mirror tab against the original tab of the same name to compare behavior before and after new trace batches are ingested.</p></div>
+    </div></div>`;
+}
+
+async function vIngestMirror(section) {
+  const base = BASE_NAV.filter(([k]) => !['label', 'sep'].includes(k));
+  const found = base.find(([k]) => k === section);
+  const label = found ? found[1] : section;
+  crumbs([[`New Trace Mirror`], [`${label}`]]);
+  const extraReq = section === 'themes' ? api(`/api/themes/${S.agent}`)
+    : section === 'fixes' ? api(`/api/bundles?agent=${S.agent}`)
+      : section === 'judges' ? api(`/api/hood/judges/${S.agent}`)
+        : Promise.resolve(null);
+
+  const [ing, old, extra] = await Promise.all([
+    api(`/api/ingest/overview?${ingestQuery()}`),
+    api(`/api/overview/${S.agent}?${overviewQuery()}`).catch(() => null),
+    extraReq.catch(() => null),
+  ]);
+  ACT.irange = el => {
+    const r = el.dataset.r;
+    if (r === 'custom') {
+      const d = ing.window || {};
+      S.ingRange = { ...S.ingRange, range: 'custom', from: S.ingRange.from || d.start || '', to: S.ingRange.to || d.end || '' };
+      location.hash = `#/ingest/${section}?range=custom&from=${S.ingRange.from}&to=${S.ingRange.to}`;
+    } else {
+      location.hash = `#/ingest/${section}?range=${r}`;
+    }
+  };
+  ACT.iapply = () => {
+    const f = $('#ifrom').value, t = $('#ito').value;
+    if (!f || !t) { toast('Pick both dates.', true); return; }
+    location.hash = `#/ingest/${section}?range=custom&from=${f}&to=${t}`;
+  };
+
+  if (section === 'themes') { page(renderMirrorThemes(section, label, ing, old, extra)); return; }
+  if (section === 'fixes') { page(renderMirrorFixes(section, label, ing, old, extra)); return; }
+  if (section === 'judges') { page(renderMirrorJudges(section, label, ing, old, extra)); return; }
+  page(renderMirrorGeneric(section, label, ing, old));
 }
 
 function themeTable(ts) {
@@ -479,6 +685,7 @@ async function vApproval(cid) {
     </div><div>
       <div class="panel"><h2>Approvers</h2>${a.approvers.map(x => `<div class="approver"><div>${esc(x.role)}<div class="small muted">${x.by ? `${esc(x.by)} · ${esc(x.at)}` : 'Not yet reviewed'}</div></div>${status(x.status)}</div>`).join('')}
         ${pending.length && a.status === 'Waiting' ? `<div style="margin-top:14px" class="stack"><label class="field">Acting as<select id="role">${pending.map(x => `<option>${esc(x.role)}</option>`).join('')}</select></label>
+          <p class="small muted">Agent-owner approvals are recorded as <b>${esc(S.boot?.settings?.approval_owner_name || 'Agent owner')}</b>.</p>
           <textarea id="cmt" placeholder="Comment (optional)"></textarea>
           <div class="actions"><button class="btn primary" data-act="dec" data-d="approve">Approve</button><button class="btn" data-act="dec" data-d="changes">Request changes</button><button class="btn danger" data-act="dec" data-d="reject">Reject</button></div></div>` : ''}</div>
       <div class="panel"><h2>Automated checks</h2><div class="kv">
@@ -487,8 +694,38 @@ async function vApproval(cid) {
       ${a.comments.length ? `<div class="panel"><h2>Comments</h2>${a.comments.map(c => `<p><b>${esc(c.by)}</b> <span class="faint small">${esc(c.at)}</span><br>${esc(c.text)}</p>`).join('')}</div>` : ''}
     </div></div>`);
   rw.init();
-  ACT.dec = el => busy(el, async () => { await post(`/api/approval/${cid}/decide`, { role: $('#role').value, decision: el.dataset.d, comment: $('#cmt').value }); toast('Decision recorded'); refreshBoot(); route(); });
+  ACT.dec = el => busy(el, async () => {
+    const role = $('#role').value;
+    const actor = role === 'Agent owner' ? (S.boot?.settings?.approval_owner_name || 'Agent owner') : role;
+    await post(`/api/approval/${cid}/decide`, { role, decision: el.dataset.d, comment: $('#cmt').value, actor });
+    toast('Decision recorded'); refreshBoot(); route();
+  });
   ACT.advance = btn => busy(btn, async () => { const r = await post(`/api/approval/${cid}/advance`); toast(r.status === 'Rolled back' ? 'Auto-rollback: guardrail metric breached' : r.status === 'Live' ? 'Promoted to production' : 'Stage passed'); route(); });
+}
+
+/* ------------------------------------------------------------------ git change evidence */
+async function vGitDelta() {
+  crumbs([[NAV_GROUP('gitdelta')], ['Nightly versions & Git evidence']]);
+  const d = await api('/api/vcs/change-evidence');
+  page(`${head('Nightly versions & Git evidence', 'Overnight Plan-B trace batches mapped to Plane-A harness promotions, owner approval, and Git code diffs.',
+    `${ext(d.repo.url, esc(d.repo.repo), 'btn')}<a class="btn" href="#/vcs">Open Version control</a><a class="btn" href="/api/vcs/change-evidence/export">Export customer report</a>`)}
+    <div class="panel"><div class="panel-head"><h2>Overnight batch versioning</h2><span class="small muted">Owner: ${esc(d.owner_name)}</span></div>
+      <table><tr><th>Batch</th><th>SemVer</th><th>Tag / Branch</th><th class="num">Traces</th><th>Approval</th><th>Mapping</th><th>Status</th></tr>
+        ${d.batches.map(b => `<tr><td class="mono">run-${b.run_id}<div class="small faint">${esc((b.finished_at || b.started_at || '').replace('T', ' ').replace('Z', ' UTC'))}</div></td>
+          <td class="mono">${esc(b.version.semver)}</td>
+          <td class="small"><span class="mono">${esc(b.version.tag)}</span><div class="mono faint">${esc(b.version.branch)}</div></td>
+          <td class="num">${num(b.traces)}</td>
+          <td class="small">${b.approval ? `<a href="#/approvals/${b.approval.id}">${esc(b.approval.id)}</a> · ${b.approval.owner_approved ? `<span class="pos">${esc(b.approval.owner_name)} approved</span>` : '<span class="neg">owner pending</span>'}` : '<span class="faint">none linked</span>'}</td>
+          <td class="small"><span class="badge ${b.mapping?.source === 'ambiguous-timestamp' ? 'warn' : b.mapping?.source === 'unmapped' ? '' : 'good'}">${esc(b.mapping?.source || 'unmapped')}</span></td>
+          <td>${status(b.status === 'ok' ? 'Validated' : b.status || 'Unknown')}</td></tr>`).join('')}
+      </table></div>
+    <div class="panel"><div class="panel-head"><h2>Most relevant Git code sections</h2><span class="small muted">Recent commits on ${esc(d.repo.base)}</span></div>
+      ${d.commits.map(c => `<div style="border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin-bottom:12px">
+        <div class="small"><b>${ext(c.url, esc(c.short), 'mono')}</b> ${esc(c.message)}<span class="faint"> · ${esc(c.author || 'unknown')} · ${esc(c.date || 'n/a')}</span></div>
+        ${c.files.map(f => `<div style="margin-top:10px"><div class="small"><b>${ext(f.url, esc(f.path), 'mono')}</b> <span class="faint">${esc(f.status || '')} · +${num(f.additions)} / -${num(f.deletions)}</span></div>
+          ${f.snippet ? `<pre class="code" style="max-height:170px">${esc(f.snippet)}</pre>` : '<div class="small faint">No patch snippet published by GitHub for this file.</div>'}</div>`).join('')}
+      </div>`).join('') || empty('No commit evidence available right now.')}
+    </div>`);
 }
 
 /* ------------------------------------------------------------------ experiments */
@@ -1364,27 +1601,50 @@ async function vJourney(tid) {
 }
 
 /* ================================================================== shell */
-const NAV = [['intro', 'Introduction'], ['label', 'Optimization Flow'], ['overview', 'Overview'], ['themes', 'Failure themes'], ['fixes', 'Fix bundles'], ['approvals', 'Approvals'],
+const BASE_NAV = [['intro', 'Introduction'], ['label', 'Optimization Flow'], ['overview', 'Overview'], ['themes', 'Failure themes'], ['fixes', 'Fix bundles'], ['approvals', 'Approvals'],
   ['experiments', 'Experiments'], ['optimizer', 'Optimizer & RL'], ['regression', 'Regression suites'], ['release', 'Release'], ['judges', 'Judges'],
   ['label', 'Evaluation & Reporting'], ['traces', 'Evidence explorer'], ['journey', 'Trace journey'], ['evaluators', 'Evaluator health'], ['patterns', 'Pattern library'],
-  ['agents', 'Agents & connections'], ['audit', 'Audit log'], ['manifest', 'Manifest hash'], ['statistics', 'Statistics'], ['rootcause', 'Root cause'],
+  ['agents', 'Agents & connections'], ['audit', 'Audit log'], ['gitdelta', 'Nightly versions & Git evidence'], ['manifest', 'Manifest hash'], ['statistics', 'Statistics'], ['rootcause', 'Root cause'],
   ['detection', 'Detection'], ['vcs', 'Version control']];
+const BASE_SECTIONS = BASE_NAV.filter(([k]) => k !== 'label' && k !== 'sep' && k !== 'gitdelta');
+const NAV = BASE_NAV.concat([['label', 'New Trace Mirror']]).concat(BASE_SECTIONS.map(([k, l]) => [`ingest/${k}`, `${l} (New Traces)`]));
 const NAV_GROUP = key => { let g = ''; for (const [k, l] of NAV) { if (k === 'label') g = l; else if (k === key) return g; } return ''; };
 const ROUTES = [[/^intro$/, vIntro], [/^overview$/, vOverview], [/^themes$/, vThemes], [/^themes\/(.+)$/, vTheme], [/^fixes$/, vFixes], [/^fixes\/([^/]+)\/([^/]+)$/, vFix],
   [/^approvals$/, vApprovals], [/^approvals\/(.+)$/, vApproval], [/^experiments$/, vExperiments], [/^experiments\/(.+)$/, vExperiment],
   [/^optimizer$/, vOptimizer], [/^regression$/, vRegression], [/^traces$/, vTraces], [/^traces\/(.+)$/, vTrace], [/^journey$/, vJourney], [/^journey\/(.+)$/, vJourney], [/^evaluators$/, vEvaluators],
-  [/^patterns$/, vPatterns], [/^agents$/, vAgents], [/^audit$/, vAudit], [/^detection$/, vHoodDetection], [/^rootcause$/, vHoodRootCause],
-  [/^statistics$/, vHoodStatistics], [/^judges$/, vHoodJudges], [/^release$/, vHoodRelease], [/^manifest$/, vHoodManifest], [/^vcs$/, vVcs]];
+  [/^patterns$/, vPatterns], [/^agents$/, vAgents], [/^audit$/, vAudit], [/^gitdelta$/, vGitDelta], [/^detection$/, vHoodDetection], [/^rootcause$/, vHoodRootCause],
+  [/^statistics$/, vHoodStatistics], [/^judges$/, vHoodJudges], [/^release$/, vHoodRelease], [/^manifest$/, vHoodManifest], [/^vcs$/, vVcs], [/^ingest\/(.+)$/, vIngestMirror]];
 
 const HOOD_KEYS = ['detection', 'rootcause', 'statistics', 'judges', 'release', 'manifest'];
-const TOP_LABEL = { optimizer: 'Optimizer', regression: 'Regression', traces: 'Evidence', evaluators: 'Evaluators', patterns: 'Patterns', agents: 'Agents', vcs: 'Git', intro: 'Intro', journey: 'Journey' };
+const TOP_LABEL = { optimizer: 'Optimizer', regression: 'Regression', traces: 'Evidence', evaluators: 'Evaluators', patterns: 'Patterns', agents: 'Agents', vcs: 'Git', gitdelta: 'Nightly Git', intro: 'Intro', journey: 'Journey' };
+function currentPath() { return location.hash.replace(/^#\/?/, '') || 'intro'; }
+function isMirrorPath(path) { return (path || '').startsWith('ingest/'); }
+function baseSectionFromPath(path) {
+  const head = (path || '').split(/[?]/)[0];
+  const parts = head.split('/').filter(Boolean);
+  if (!parts.length) return 'overview';
+  return parts[0] === 'ingest' ? (parts[1] || 'overview') : parts[0];
+}
+function compareTarget(mode, path) {
+  const raw = path || currentPath();
+  const query = raw.includes('?') ? raw.slice(raw.indexOf('?')) : '';
+  const section = baseSectionFromPath(raw);
+  return mode === 'mirror' ? `#/ingest/${section}${query}` : `#/${section}${query}`;
+}
 function renderTopNav(section) {
-  const items = NAV.filter(([k]) => k !== 'sep' && k !== 'label' && k !== 'vcs' && !HOOD_KEYS.includes(k)).map(([k, l]) => [k, TOP_LABEL[k] || l])
+  const items = BASE_NAV.filter(([k]) => k !== 'sep' && k !== 'label' && k !== 'vcs' && !HOOD_KEYS.includes(k)).map(([k, l]) => [k, TOP_LABEL[k] || l])
     .concat([['detection', 'Under the hood'], ['vcs', TOP_LABEL.vcs]]);
   $('#topnav').innerHTML = items.map(([k, l], i) => {
     const on = k === section || (k === 'detection' && HOOD_KEYS.includes(section));
     return `<li><a href="#/${k}" class="${on ? 'active' : ''}" ${on ? 'aria-current="page"' : ''}><span class="n">${i + 1}</span> ${l}${k === 'approvals' && S.boot?.waiting ? `<span class="count">${S.boot.waiting}</span>` : ''}</a></li>`;
   }).join('');
+  const cmp = $('#compare-toggle');
+  if (cmp) {
+    const path = currentPath();
+    const onMirror = isMirrorPath(path);
+    cmp.innerHTML = `<a class="${onMirror ? '' : 'on'}" href="${compareTarget('original', path)}">Original</a>
+      <a class="${onMirror ? 'on' : ''}" href="${compareTarget('mirror', path)}">New Traces</a>`;
+  }
   const reveal = () => {  // scroll only the tab strip, never the page
     const ul = $('#topnav'), a = $('#topnav a.active');
     if (!a) return;
@@ -1403,10 +1663,10 @@ function renderNav(section) {
 
 async function route() {
   S.timers.forEach(clearInterval); S.timers = []; clearInterval(S.jobTimer); ACT = {};
-  const h = location.hash.replace(/^#\/?/, '') || 'intro';
+  const h = currentPath();
   const [path, qs] = h.split('?');
   S.query = new URLSearchParams(qs || '');
-  renderNav(path.split('/')[0]);
+  renderNav(path.startsWith('ingest/') ? `ingest/${path.split('/')[1] || 'overview'}` : path.split('/')[0]);
   page('<div class="loading">Loading…</div>');
   for (const [re, fn] of ROUTES) {
     const m = path.match(re);
@@ -1426,7 +1686,10 @@ async function refreshBoot() {
   sel.innerHTML = S.boot.agents.map(a => `<option value="${a.id}" ${a.id === S.agent ? 'selected' : ''}>${esc(a.name)}</option>`).join('');
   $('#llm-state').innerHTML = `${S.boot.llm ? 'LLM proposer: connected' : 'LLM proposer: off (simulation only)'}<br>
     GitHub: ${ext(S.boot.git.url, esc(S.boot.git.repo))} · ${S.boot.git.live ? 'live PRs' : 'dry run'}`;
-  renderNav((location.hash.replace(/^#\/?/, '').split(/[/?]/)[0]) || 'overview');
+  const path = location.hash.replace(/^#\/?/, '');
+  const head = path.split(/[?]/)[0];
+  renderNav(head.startsWith('ingest/') ? `ingest/${head.split('/')[1] || 'overview'}` : (head.split('/')[0] || 'overview'));
+  await refreshHealthPanel();
 }
 
 async function boot() {
@@ -1444,6 +1707,7 @@ async function boot() {
     e.target.disabled = false; e.target.textContent = 'Reset demo data'; toast('Demo data re-seeded'); route();
   });
   window.addEventListener('hashchange', route);
+  if (!S.healthTimer) S.healthTimer = setInterval(() => { refreshHealthPanel(); }, 20000);
   route();
 }
 boot();

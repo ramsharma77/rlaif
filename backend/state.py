@@ -13,6 +13,7 @@ import zlib
 from collections import Counter
 
 from .engine import analysis as A, env, evaluate as E, harness as H, jobs, judges, optimizer, rl, vcs
+from .engine.config import get_settings
 
 LOCK = threading.RLock()
 START = dt.date(2026, 9, 12)
@@ -577,11 +578,12 @@ def candidates(aid):
 
 # ------------------------------------------------------------ optimizer / RL
 def start_optimizer(P):
+    cfgs = get_settings()
     aid = P.get("agent", "billing")
     base = get_h(P.get("base_id") or prod(aid)["id"])
     cfg = judge_cfg(aid)
     emp_ok = empathy_ok(aid)
-    audit("You", "Optimizer run started", aid, f"budget {P.get('budget', 6000)} rollouts")
+    audit("You", "Optimizer run started", aid, f"budget {P.get('budget', cfgs.optimizer_budget)} rollouts")
 
     def fn(job):
         res = optimizer.run(job, P, base, cfg, emp_ok)
@@ -601,12 +603,13 @@ def start_optimizer(P):
 
 
 def start_rl(P):
+    cfgs = get_settings()
     aid = P.get("agent", "billing")
     base = get_h(P.get("base_id") or prod(aid)["id"])
     if agent(aid)["level"] != "1p_repo":
         raise ValueError("RL fine-tuning of weights needs a first-party agent with repo access.")
     cfg = judge_cfg(aid)
-    audit("You", "RL run started", base["id"], f"{P.get('algorithm', 'grpo')} · reward {P.get('reward_source', 'judge')}")
+    audit("You", "RL run started", base["id"], f"{P.get('algorithm', cfgs.rl_algorithm)} · reward {P.get('reward_source', 'judge')}")
 
     def fn(job):
         res = rl.train(job, P, base, cfg)
@@ -617,7 +620,7 @@ def start_rl(P):
             h["name"] = f"{base['name'].split(':')[0]} + adapter W-{n}"
             h["adapter"], h["adapter_id"] = res["adapter"], f"W-{n}"
             h["version"] = _next_version(aid, draft=True)
-            h["parent"], h["note"] = base["id"], f"{P.get('algorithm', 'grpo').upper()} on {P.get('reward_source', 'judge')} reward"
+            h["parent"], h["note"] = base["id"], f"{P.get('algorithm', cfgs.rl_algorithm).upper()} on {P.get('reward_source', 'judge')} reward"
             h.pop("released_day", None)
             register(h)
             res["candidate"] = {"id": h["id"], "name": h["name"]}
@@ -753,7 +756,7 @@ def route(edits, aid):
     return POLICY[idx]["type"], appr, POLICY[idx]["rollout"]
 
 
-def create_approval(aid, cand_id, title, bundle_id=None, fix_ids=None, day_offset=0, actor="You", checks=None):
+def create_approval(aid, cand_id, title, bundle_id=None, fix_ids=None, day_offset=0, actor="You", checks=None, run_id=None):
     base = prod(aid)
     cand = get_h(cand_id)
     edits = H.edits_between(base, cand)
@@ -766,6 +769,7 @@ def create_approval(aid, cand_id, title, bundle_id=None, fix_ids=None, day_offse
                   "frozen": "Untouched", "judge": f"κ {calibration_kappa(aid):.2f}"}
     ap = {"id": cid, "title": title, "agent": aid, "agent_name": agent(aid)["name"], "base_id": base["id"],
           "harness_id": cand_id, "bundle_id": bundle_id, "fix_ids": fix_ids or [], "change_type": ctype,
+          "run_id": run_id,
           "layers": sorted({H.edit_layer(e) for e in edits}), "risk": H.edits_risk(edits),
           "edit_labels": [H.edit_label(e) for e in edits], "rollout_plan": rollout,
           "approvers": [{"role": r, "status": "Pending", "by": None, "at": None, "comment": ""} for r in approvers],
@@ -776,8 +780,20 @@ def create_approval(aid, cand_id, title, bundle_id=None, fix_ids=None, day_offse
         for f in S["bundles"][bundle_id]["fixes"]:
             if f["id"] in (fix_ids or []):
                 f["status"] = "Awaiting approval"
+    if run_id is not None:
+        S.setdefault("run_links", {})[int(run_id)] = cid
     audit(actor, "Sent to approvals", cid, f"{title} · {ctype}")
     return ap
+
+
+def link_run_approval(run_id, cid, actor="You"):
+    run_id = int(run_id)
+    if cid not in S["approvals"]:
+        raise ValueError(f"Unknown approval {cid}")
+    S.setdefault("run_links", {})[run_id] = cid
+    S["approvals"][cid]["run_id"] = run_id
+    audit(actor, "Run linked to approval", cid, f"run_id={run_id}")
+    return {"run_id": run_id, "approval_id": cid, "ok": True}
 
 
 def approval_view(ap):
@@ -800,10 +816,12 @@ def decide(cid, role, decision, comment="", actor=None):
     slot = next((a for a in ap["approvers"] if a["role"] == role), None)
     if not slot:
         raise ValueError(f"{role} is not an approver for {cid}")
+    owner_name = (get_settings().approval_owner_name or "Agent owner").strip()
+    approver_name = owner_name if role == "Agent owner" else (actor or role)
     slot.update(status={"approve": "Approved", "changes": "Changes requested", "reject": "Rejected"}[decision],
-                by=actor or role, at=now_iso(), comment=comment)
+                by=approver_name, at=now_iso(), comment=comment)
     if comment:
-        ap["comments"].append({"by": actor or role, "text": comment, "at": now_iso()})
+        ap["comments"].append({"by": approver_name, "text": comment, "at": now_iso()})
     if decision == "reject":
         ap["status"] = "Rejected"
     elif decision == "changes":
@@ -812,7 +830,7 @@ def decide(cid, role, decision, comment="", actor=None):
         ap["status"] = "Approved"
         ap["decided_days"] = max(1, ap.get("age_days", 1))
         ap["rollout"] = {"stage": -1, "stages": [{"name": s, "status": "Pending", "metrics": None} for s in STAGES]}
-    audit(actor or role, {"approve": "Approved", "changes": "Changes requested", "reject": "Rejected"}[decision], cid, comment)
+    audit(approver_name, {"approve": "Approved", "changes": "Changes requested", "reject": "Rejected"}[decision], cid, comment)
     return approval_view(ap)
 
 
@@ -998,7 +1016,7 @@ def register_agent(name, typ, level, owner, traffic, actor="You"):
 
 
 # --------------------------------------------------------------------- views
-RANGES = {"24h": 1, "7d": 7, "30d": 30}
+RANGES = {"24h": 1, "7d": 7, "30d": 30, "90d": 90, "12m": 365}
 
 
 def _window(ts, rng="7d", start=None, end=None):
@@ -1087,7 +1105,7 @@ def seed():
         S.update(harnesses={}, production={}, traces={}, eps={}, themes={}, theme_index={}, bundles={},
                  bundle_by_theme={}, experiments={}, suites={}, suite_by_agent={}, approvals={}, patterns=[],
                  audit=[], labels={}, counters={"exp": 23, "cr": 1041, "bundle": 0, "pattern": 0}, evaluators={},
-                 calibration={}, kappa_threshold=0.70, extra_agents=[])
+                 calibration={}, kappa_threshold=0.70, extra_agents=[], run_links={})
         base_lines = ["L_role", "L_identity", "L_credit_policy", "L_tone"]
         register(H.new_harness("billing-v13", "billing", "billing", "v13", "v13", base_lines, note="Previous production"), -30)
         register(H.new_harness("billing-v14", "billing", "billing", "v14 in production", "v14", base_lines + ["L_few_turns"],

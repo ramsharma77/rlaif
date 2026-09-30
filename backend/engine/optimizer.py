@@ -13,21 +13,26 @@ import random
 from collections import Counter
 
 from . import evaluate as E, harness as H, analysis as A, llm, env
+from .config import get_settings
 
 SIG_LABEL = {"premature": "closed right after quote_credit with an open question or dispute",
              "dispute": "closed with the disputed charge unaddressed", "silent": "closed on a silent customer",
              "violation": "applied a credit above the policy limit", "eta": "stated an ETA without outage_status"}
 
 
-def mutation_space(kind):
+def mutation_space(kind, enabled_dimensions=None):
+    dims = set(enabled_dimensions or ["lines", "gates", "tools"])
     space = []
-    for lid, meta in H.LINES.items():
-        if kind in meta.get("agents", []) and not meta.get("frozen") and lid not in ("L_role", "L_role_outage"):
-            space += [{"op": "add_line", "id": lid}, {"op": "remove_line", "id": lid}]
-    for gid, meta in H.GATES.items():
-        if kind in meta["agents"]:
-            space += [{"op": "gate_on", "id": gid}, {"op": "gate_off", "id": gid}]
-    space += [{"op": "tool", "id": "close_ticket", "value": "strict"}, {"op": "tool", "id": "close_ticket", "value": "default"}]
+    if "lines" in dims:
+        for lid, meta in H.LINES.items():
+            if kind in meta.get("agents", []) and not meta.get("frozen") and lid not in ("L_role", "L_role_outage"):
+                space += [{"op": "add_line", "id": lid}, {"op": "remove_line", "id": lid}]
+    if "gates" in dims:
+        for gid, meta in H.GATES.items():
+            if kind in meta["agents"]:
+                space += [{"op": "gate_on", "id": gid}, {"op": "gate_off", "id": gid}]
+    if "tools" in dims:
+        space += [{"op": "tool", "id": "close_ticket", "value": "strict"}, {"op": "tool", "id": "close_ticket", "value": "default"}]
     return space
 
 
@@ -55,12 +60,17 @@ def signatures(recs):
 
 
 def run(job, P, base, cfg, empathy_ok=True):
+    S = get_settings()
     rng = random.Random(P.get("seed", 1))
     kind = base["kind"]
-    budget, mb = int(P.get("budget", 6000)), int(P.get("minibatch", 40))
-    n_opt, n_sel, n_conf = int(P.get("n_opt", 200)), int(P.get("n_sel", 300)), int(P.get("n_conf", 600))
-    w = {**E.DEFAULT_WEIGHTS, **P.get("weights", {})}
-    mode, eps, do_merge = P.get("policy_mode", "constraint"), float(P.get("epsilon", 0.2)), P.get("merge", True)
+    budget, mb = int(P.get("budget", S.optimizer_budget)), int(P.get("minibatch", S.optimizer_minibatch))
+    n_opt = int(P.get("n_opt", S.optimizer_n_opt))
+    n_sel = int(P.get("n_sel", S.optimizer_n_sel))
+    n_conf = int(P.get("n_conf", S.optimizer_n_conf))
+    w = {**S.default_reward_weights, **P.get("weights", {})}
+    mode = P.get("policy_mode", "constraint")
+    eps = float(P.get("epsilon", S.optimizer_epsilon))
+    do_merge = P.get("merge", True)
     use_llm = P.get("use_llm") and llm.available()
     sim_error = float(P.get("sim_error", 0.0))
     if w.get("empathy") and not empathy_ok:
@@ -71,7 +81,11 @@ def run(job, P, base, cfg, empathy_ok=True):
     sel_seeds = list(range(200000 + off, 200000 + off + n_sel))
     conf_seeds = list(range(300000 + off, 300000 + off + n_conf))
     rew = lambda r: E.reward(r, w, mode, use_emp)
-    space = mutation_space(kind)
+    dims = P.get("dimensions") or S.optimizer_dimensions
+    top_p_dims = int(P.get("top_p_dimensions", S.optimizer_top_p_dimensions))
+    if top_p_dims > 0 and len(dims) > top_p_dims:
+        dims = dims[:top_p_dims]
+    space = mutation_space(kind, dims)
 
     def evaluate(h, seeds):
         return {r["seed"]: r for r in E.run(h, seeds, cfg, sim_error=sim_error)}
@@ -192,7 +206,7 @@ def run(job, P, base, cfg, empathy_ok=True):
 
     # ---------------- selection on a separate split, Holm-corrected
     wins = frontier()
-    feas = sorted([e for e in pool if feasible(e) and e["id"] != "c0"], key=lambda e: -e["reward"])[:int(P.get("top_k", 3))]
+    feas = sorted([e for e in pool if feasible(e) and e["id"] != "c0"], key=lambda e: -e["reward"])[:int(P.get("top_k", S.optimizer_top_k))]
     job.log(f"Search finished: {len(pool) + len(rejected) - 1} candidates explored, {used}/{budget} rollouts. "
             f"Selecting among top {len(feas)} on a fresh split (n={n_sel}).")
     base_sel = E.run(base, sel_seeds, cfg, sim_error=sim_error)

@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 
 from .harness import LINES
 from .env import SCENARIO_LABEL
+from . import clustering
 
 THEMES = [
     {"key": "policy", "name": "Credit above policy limit issued", "layer": "Guardrail",
@@ -103,13 +104,22 @@ def build_themes(agent, traces, versions):
         if key == "other":
             sev = "Low"
         subs = Counter(t["type"] for t in items)
+        subclusters = [{"label": SCENARIO_LABEL.get(k, k), "share": v / len(items)} for k, v in subs.most_common()]
+        semantic = None
+        if key == "other":
+            snippets = [t.get("snippet") or t.get("label") or t["type"] for t in items]
+            semantic = clustering.cluster_texts(snippets)
+            total = max(1, len(semantic.get("assignments", [])))
+            subclusters = [{"label": c["label"], "share": c["count"] / total}
+                           for c in semantic.get("clusters", [])]
         out.append({
             "id": f"{agent}-{key}", "key": key, "agent": agent, "name": theme_name(key, kind),
             "desc": THEME_BY_KEY[key]["desc"], "layer": THEME_BY_KEY[key]["layer"], "sev": sev,
             "traces": len(items), "share": share, "trend": (last7 - prev7) / prev7 if prev7 else (1.0 if last7 else 0.0),
             "repeat_rate": repeat, "repeat_base": repeat_base, "csat": csat, "first_seen_day": first_seen,
             "daily": [daily.get(d, 0) for d in range(last_day + 1)],
-            "subclusters": [{"label": SCENARIO_LABEL.get(k, k), "share": v / len(items)} for k, v in subs.most_common()],
+            "subclusters": subclusters,
+            "semantic": semantic,
             "root_cause": root_cause(key, items, traces, versions),
         })
     order = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3}

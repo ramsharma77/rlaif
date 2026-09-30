@@ -7,13 +7,13 @@ approvals, regression gates and a staged rollout, recording every step in a hash
 
 Everything runs on a deterministic simulation, so no model API key is needed.
 
-Repository: https://github.com/bhairavmehta/harness-optimization-engine
+Repository: https://github.com/ramsharma77/rlaif
 
 ## Run
 
 ```bash
-git clone https://github.com/bhairavmehta/harness-optimization-engine.git
-cd harness-optimization-engine
+git clone https://github.com/ramsharma77/rlaif.git
+cd rlaif
 ./run.sh                       # or: pip install -r requirements.txt && uvicorn backend.app:app --reload
 open http://localhost:8000
 ```
@@ -24,10 +24,62 @@ re-seeds the demo.
 Optional: `export ANTHROPIC_API_KEY=...` enables the LLM reflective proposer in harness search.
 `HOE_LLM_MODEL` sets the model (default `claude-sonnet-5`).
 
+## Centralized runtime configuration
+
+This repo now exposes a single configuration surface for ingestion, optimizer/RL,
+semantic clustering and fallback behavior.
+
+- Environment template: `.env.example`
+- Backend settings module: `backend/engine/config.py`
+- API view: `GET /api/config`
+
+Key controls include:
+
+- trace inputs and ingestion thresholds (`HOE_TRACE_FILE_PATHS`, line/trace limits)
+- optimizer search shape (`HOE_OPT_*`, dimensions, top-p dimensions)
+- RL defaults (`HOE_RL_*`)
+- KPI focus list (`HOE_BUSINESS_KPIS`)
+- semantic clustering runtime and fallback (`HOE_SEMANTIC_*`, `HOE_LLAMA_SERVER_URL`, `HOE_ANTHROPIC_FALLBACK_MODEL`)
+
+## Local SLM (GGUF) and semantic clustering runtime
+
+The local-first semantic runtime uses llama.cpp server. A repo-owned copy of the
+newest matching Qwen GGUF can be provisioned from your shared SLM folder.
+
+- Setup and copy model: `POST /api/slm/setup`
+- Probe runtime health: `GET /api/slm/probe`
+- Launch managed llama.cpp server: `POST /api/slm/launch`
+- Managed runtime status: `GET /api/slm/status`
+- Stop managed llama.cpp server: `POST /api/slm/stop`
+- Ad-hoc semantic clustering: `POST /api/semantic/cluster` with `{"texts": [...]}`
+
+Behavior order:
+
+1. llama.cpp server (`HOE_LLAMA_SERVER_URL`)
+2. Anthropic Haiku fallback (only if local runtime is unavailable or fails)
+3. deterministic lexical fallback (safety net)
+
+## Production trace ingestion and persisted dashboard metrics
+
+Trace ingestion now supports incremental append from JSONL exports into SQLite
+with quarantine-and-continue behavior.
+
+- Run ingestion: `POST /api/ingest/run`
+  - Optional body: `{"paths": ["C:/.../file1.jsonl", "C:/.../file2.jsonl"]}`
+- List ingest runs: `GET /api/ingest/runs`
+- Aggregated KPI window: `GET /api/ingest/overview?range=7d`
+  - Supported ranges: `24h`, `7d`, `30d`, `90d`, `12m`, `custom`
+  - Custom window: `range=custom&start=YYYY-MM-DD&end=YYYY-MM-DD`
+
+Current guardrails are controlled by env/config:
+
+- line-level quarantine only above 1.5 MB (`HOE_INGEST_LINE_MAX_BYTES`)
+- trace-object soft size at 500 KB (`HOE_INGEST_TRACE_SOFT_MAX_BYTES`)
+
 ## GitHub pull requests
 
 For the first-party billing agent, **Fix bundles → Open pull request** delivers a fix to
-[bhairavmehta/harness-optimization-engine](https://github.com/bhairavmehta/harness-optimization-engine):
+[ramsharma77/rlaif](https://github.com/ramsharma77/rlaif):
 it creates branch `hoe/<bundle>-<fix>` from `main`, commits the production baseline and then the fix to
 `agents/billing/system_prompt.md` and `agents/billing/harness.yaml`, and opens a PR whose body carries the
 theme, offline-replay lift, regression result and diff. The fix page, audit log and Agents page link to the
@@ -39,9 +91,32 @@ Without a token it is a **dry run**: the same links, plus the `git` / `gh` comma
 export GITHUB_TOKEN=$(gh auth token)   # or a fine-grained token: Contents + Pull requests (read/write)
 ```
 
-Optional: `HOE_GITHUB_REPO` (default `bhairavmehta/harness-optimization-engine`), `HOE_GITHUB_BASE` (`main`),
+Optional: `HOE_GITHUB_REPO` (default `ramsharma77/rlaif`), `HOE_GITHUB_BASE` (`main`),
 `HOE_GITHUB_PATH` (`agents/{agent}`). Code: `backend/engine/vcs.py`. Leave the token unset on public
 deployments, or anyone with the URL can open PRs.
+
+## Nightly RL batch versioning and release evidence
+
+The app supports a strict, audit-friendly chain from overnight Plan-B runs to Plane-A harness promotions.
+
+- Strict mapping priority:
+  - explicit `run_id` on approval records
+  - explicit run-to-approval links (`POST /api/approval/{cid}/link-run`)
+  - strict timestamp fallback (only unique candidate in a 0-24h window)
+- Mapping source is shown per batch (`explicit-run-id`, `explicit-link`, `timestamp-strict`, `ambiguous-timestamp`, `unmapped`).
+- Owner approval identity is centralized (`HOE_APPROVAL_OWNER_NAME`) and used for Agent owner sign-off.
+- On Agent owner approval, release refs are auto-created for the mapped nightly batch:
+  - tag: `planea-YYYYMMDD.b<run_id>`
+  - branch: `release/plane-a/YYYYMMDD-b<run_id>`
+- One-click customer export report:
+  - UI: **Nightly versions & Git evidence → Export customer report**
+  - API: `GET /api/vcs/change-evidence/export`
+
+Related APIs:
+
+- `GET /api/vcs/change-evidence`
+- `GET /api/vcs/change-evidence/export`
+- `POST /api/approval/{cid}/link-run`
 
 ## Version control
 

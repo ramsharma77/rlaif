@@ -19,6 +19,7 @@ import math
 import random
 
 from . import env, judges, evaluate as E
+from .config import get_settings
 
 
 def _zero(kind):
@@ -30,13 +31,20 @@ def _kl(p, q):
 
 
 def train(job, P, base, cfg):
-    algo = P.get("algorithm", "grpo")
-    iters, batch, group = int(P.get("iterations", 30)), int(P.get("batch", 12)), int(P.get("group", 4))
-    lr, kl_coef, beta = float(P.get("lr", 0.5)), float(P.get("kl_coef", 0.05)), float(P.get("beta", 0.5))
+    S = get_settings()
+    algo = P.get("algorithm", S.rl_algorithm)
+    iters = int(P.get("iterations", S.rl_iterations))
+    batch = int(P.get("batch", S.rl_batch))
+    group = int(P.get("group", S.rl_group))
+    lr = float(P.get("lr", S.rl_lr))
+    kl_coef = float(P.get("kl_coef", S.rl_kl_coef))
+    beta = float(P.get("beta", S.rl_beta))
     source, mode = P.get("reward_source", "judge"), P.get("policy_mode", "constraint")
-    w = {**E.DEFAULT_WEIGHTS, **P.get("weights", {})}
+    w = {**S.default_reward_weights, **P.get("weights", {})}
     swap, pos_bias = P.get("swap_positions", True), float(P.get("position_bias", 0.08))
-    seed, eval_every, n_eval = int(P.get("seed", 1)), int(P.get("eval_every", 5)), int(P.get("n_eval", 200))
+    seed = int(P.get("seed", 1))
+    eval_every = int(P.get("eval_every", S.rl_eval_every))
+    n_eval = int(P.get("n_eval", S.rl_eval_n))
     rng = random.Random(seed)
 
     ref = copy.deepcopy(base)

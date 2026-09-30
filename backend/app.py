@@ -3,6 +3,7 @@
 Run:  uvicorn backend.app:app --reload   (from the project root)
 """
 import json
+import datetime as dt
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -10,7 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import hood, journey, state as st
-from .engine import env, harness as H, jobs, llm, vcs
+from .engine import clustering, config, env, harness as H, ingest, jobs, llm, slm, vcs
 
 app = FastAPI(title="Harness Optimization Engine", version="1.0")
 FRONTEND = Path(__file__).resolve().parent.parent / "frontend"
@@ -43,6 +44,7 @@ def locked(fn, *a, **k):
 @app.get("/api/bootstrap")
 def bootstrap():
     return {"agents": st.agents_view()["items"], "waiting": st.approvals()["waiting"], "llm": llm.available(), "git": vcs.status(),
+            "settings": config.public_settings(),
             "library": {"lines": H.LINES, "gates": H.GATES, "tools": H.TOOLS, "criteria": H.CRITERIA},
             "decisions": env.DECISION_LABEL, "actions": env.ACTION_LABEL}
 
@@ -50,6 +52,66 @@ def bootstrap():
 @app.post("/api/reset")
 def reset():
     return locked(st.reset)
+
+
+@app.get("/api/config")
+def config_view(refresh: bool = False):
+    return config.public_settings(refresh=refresh)
+
+
+@app.post("/api/slm/setup")
+def slm_setup():
+    # I/O and optional network checks; no state lock needed.
+    return slm.setup_local_slm()
+
+
+@app.get("/api/slm/probe")
+def slm_probe(url: str = None):
+    return slm.probe_llama_server(base_url=url)
+
+
+@app.get("/api/slm/status")
+def slm_status():
+    return slm.llama_status()
+
+
+@app.post("/api/slm/launch")
+def slm_launch():
+    return slm.launch_llama_server()
+
+
+@app.post("/api/slm/stop")
+def slm_stop():
+    return slm.stop_llama_server()
+
+
+@app.post("/api/semantic/cluster")
+async def semantic_cluster(req: Request):
+    b = await body(req)
+    texts = b.get("texts") or []
+    top_k = b.get("top_k")
+    if not isinstance(texts, list):
+        raise HTTPException(400, "texts must be an array")
+    return clustering.cluster_texts([str(x) for x in texts], top_k=top_k)
+
+
+@app.post("/api/ingest/run")
+async def ingest_run(req: Request):
+    b = await body(req)
+    paths = b.get("paths")
+    if paths is not None and not isinstance(paths, list):
+        raise HTTPException(400, "paths must be an array of file paths")
+    return ingest.ingest_traces(paths=paths)
+
+
+@app.get("/api/ingest/runs")
+def ingest_runs(limit: int = 20):
+    return ingest.list_runs(limit=limit)
+
+
+@app.get("/api/ingest/overview")
+def ingest_overview(range: str = "7d", start: str = None, end: str = None):
+    return ingest.overview(range_key=range, start=start, end=end)
 
 
 # ------------------------------------------------------------------ overview & themes
@@ -168,10 +230,12 @@ async def deliver(bid: str, fid: str, req: Request):
 
 @app.post("/api/fix/{bid}/{fid}/approve-request")
 async def fix_to_approval(bid: str, fid: str, req: Request):
+    b = await body(req)
     def fn():
         f = next(x for x in st.S["bundles"][bid]["fixes"] if x["id"] == fid)
         h = st._fix_harness(st.S["bundles"][bid], f)
-        return st.create_approval(st.S["bundles"][bid]["agent"], h["id"], f["title"], bundle_id=bid, fix_ids=[fid])
+        run_id = b.get("run_id")
+        return st.create_approval(st.S["bundles"][bid]["agent"], h["id"], f["title"], bundle_id=bid, fix_ids=[fid], run_id=run_id)
     return locked(fn)
 
 
@@ -199,7 +263,7 @@ async def promote(eid: str, req: Request):
     def fn():
         e = st.S["experiments"][eid]
         h = st.get_h(b["candidate"])
-        return st.create_approval(e["agent"], h["id"], f"{h['name']} (from {eid})")
+        return st.create_approval(e["agent"], h["id"], f"{h['name']} (from {eid})", run_id=b.get("run_id"))
     return locked(fn)
 
 
@@ -274,7 +338,18 @@ def approval(cid: str):
 @app.post("/api/approval/{cid}/decide")
 async def decide(cid: str, req: Request):
     b = await body(req)
-    return locked(st.decide, cid, b["role"], b["decision"], b.get("comment", ""), b.get("actor"))
+    out = locked(st.decide, cid, b["role"], b["decision"], b.get("comment", ""), b.get("actor"))
+    if b.get("role") == "Agent owner" and b.get("decision") == "approve":
+        _auto_release_refs_on_owner_approval(cid)
+    return out
+
+
+@app.post("/api/approval/{cid}/link-run")
+async def link_run(cid: str, req: Request):
+    b = await body(req)
+    if b.get("run_id") is None:
+        raise HTTPException(400, "run_id is required")
+    return locked(st.link_run_approval, int(b["run_id"]), cid, b.get("actor", "You"))
 
 
 @app.post("/api/approval/{cid}/advance")
@@ -401,6 +476,181 @@ def vcs_sync():
                  out["error"] or f"main @ {out['head']['short']} · " + ("code in sync" if s.get("in_sync") else f"{len(s.get('drift', []))} files differ"))
         out["activity"] = [r for r in st.S["audit"][::-1] if r["event"].startswith(GIT_EVENTS)][:50]
     return out
+
+
+def _nightly_version_label(run: dict, seq: int) -> tuple[str, str, str]:
+    ts = (run.get("finished_at") or run.get("started_at") or "")[:10]
+    day = ts.replace("-", "") if ts else "unknown"
+    tag = f"planea-{day}.b{run['id']}"
+    semver = f"v1.0.{run['id']}-nightly+b{seq}"
+    branch = f"release/plane-a/{day}-b{run['id']}"
+    return tag, semver, branch
+
+
+def _parse_ts(ts: str | None) -> dt.datetime | None:
+    if not ts:
+        return None
+    txt = str(ts).strip().replace("Z", "+00:00")
+    try:
+        return dt.datetime.fromisoformat(txt)
+    except ValueError:
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return dt.datetime.strptime(txt, fmt).replace(tzinfo=dt.timezone.utc)
+            except ValueError:
+                continue
+    return None
+
+
+def _strict_run_approval_map(runs: list[dict], approvals: list[dict], run_links: dict[int, str]) -> dict[int, dict]:
+    mapped: dict[int, dict] = {}
+    by_id = {a["id"]: a for a in approvals}
+
+    # Explicit links first (run_links and approval.run_id).
+    for rid, cid in (run_links or {}).items():
+        a = by_id.get(cid)
+        if a:
+            mapped[int(rid)] = {"approval": a, "source": "explicit-link"}
+    for a in approvals:
+        rid = a.get("run_id")
+        if rid is not None:
+            mapped[int(rid)] = {"approval": a, "source": "explicit-run-id"}
+
+    # Strict timestamp fallback only when unique candidate exists in [0, 24h].
+    for r in runs:
+        rid = int(r["id"])
+        if rid in mapped:
+            continue
+        done = _parse_ts(r.get("finished_at") or r.get("started_at"))
+        if not done:
+            continue
+        cands = []
+        for a in approvals:
+            created = _parse_ts(a.get("created"))
+            if not created:
+                continue
+            delta = (created - done).total_seconds()
+            if 0 <= delta <= 86400:
+                cands.append((delta, a))
+        cands.sort(key=lambda x: x[0])
+        if len(cands) == 1:
+            mapped[rid] = {"approval": cands[0][1], "source": "timestamp-strict"}
+        elif len(cands) > 1:
+            mapped[rid] = {"approval": None, "source": "ambiguous-timestamp"}
+    return mapped
+
+
+def _build_change_evidence(limit_commits: int = 8, limit_runs: int = 20):
+    runs = ingest.list_runs(limit=limit_runs).get("items", [])
+    commits = vcs.change_evidence(limit_commits=limit_commits, files_per_commit=3)
+    owner_name = (config.get_settings().approval_owner_name or "Agent owner").strip()
+    with st.LOCK:
+        approvals = sorted(st.S.get("approvals", {}).values(), key=lambda a: int(a["id"].split("-")[1]), reverse=True)
+        run_links = dict(st.S.get("run_links", {}))
+
+    mapping = _strict_run_approval_map(runs, approvals, run_links)
+    items = []
+    for i, r in enumerate(runs):
+        tag, semver, branch = _nightly_version_label(r, i + 1)
+        rid = int(r["id"])
+        m = mapping.get(rid)
+        ap = m and m.get("approval")
+        owner_slot = next((x for x in (ap.get("approvers", []) if ap else []) if x.get("role") == "Agent owner"), None)
+        items.append({
+            "run_id": rid,
+            "status": r.get("status"),
+            "started_at": r.get("started_at"),
+            "finished_at": r.get("finished_at"),
+            "traces": r.get("traces", 0),
+            "parse_errors": r.get("parse_errors", 0),
+            "line_quarantined": r.get("line_quarantined", 0),
+            "trace_soft_oversize": r.get("trace_soft_oversize", 0),
+            "version": {"tag": tag, "semver": semver, "branch": branch},
+            "mapping": {"source": m.get("source") if m else "unmapped"},
+            "promotion": {"plane_b": "Overnight RL Plan-B run", "plane_a": "Request-plane harness components"},
+            "approval": None if not ap else {
+                "id": ap.get("id"),
+                "title": ap.get("title"),
+                "status": ap.get("status"),
+                "owner_name": owner_name,
+                "owner_approved": bool(owner_slot and owner_slot.get("status") == "Approved"),
+                "owner_approved_at": owner_slot and owner_slot.get("at"),
+                "fix_ids": ap.get("fix_ids", []),
+                "bundle_id": ap.get("bundle_id"),
+            },
+        })
+    return {"repo": vcs.status(), "owner_name": owner_name, "batches": items, "commits": commits}
+
+
+def _auto_release_refs_on_owner_approval(cid: str):
+    with st.LOCK:
+        ap = st.S.get("approvals", {}).get(cid)
+        run_links = dict(st.S.get("run_links", {}))
+    if not ap:
+        return
+    runs = ingest.list_runs(limit=50).get("items", [])
+    mapping = _strict_run_approval_map(runs, [ap], run_links)
+    run = None
+    for r in runs:
+        m = mapping.get(int(r["id"]))
+        ap = m.get("approval") if m else None
+        if ap and ap.get("id") == cid:
+            run = r
+            break
+    if not run:
+        return
+    seq = next((i + 1 for i, rr in enumerate(runs) if int(rr["id"]) == int(run["id"])), 1)
+    tag, _, branch = _nightly_version_label(run, seq)
+    refs = vcs.ensure_release_refs(tag=tag, branch=branch)
+    with st.LOCK:
+        st.audit("Release bot", "Version refs updated", cid,
+                 f"run={run['id']} tag={tag} branch={branch} live={refs.get('live')} created_tag={refs.get('tag_created')} created_branch={refs.get('branch_created')}")
+
+
+@app.get("/api/vcs/change-evidence")
+def vcs_change_evidence(limit_commits: int = 8, limit_runs: int = 20):
+    return _build_change_evidence(limit_commits=limit_commits, limit_runs=limit_runs)
+
+
+@app.get("/api/vcs/change-evidence/export")
+def vcs_change_evidence_export(limit_commits: int = 8, limit_runs: int = 20):
+    d = _build_change_evidence(limit_commits=limit_commits, limit_runs=limit_runs)
+    lines = [
+        "# Customer Change Evidence Report",
+        "",
+        f"Repository: {d['repo']['repo']} ({d['repo']['url']})",
+        f"Owner approver: {d['owner_name']}",
+        "",
+        "## Batch to Approval Chain",
+    ]
+    for b in d["batches"]:
+        lines += [
+            "",
+            f"### Batch run-{b['run_id']} · {b['status']}",
+            f"- Window: {b.get('started_at') or 'n/a'} -> {b.get('finished_at') or 'n/a'}",
+            f"- Traces: {b.get('traces', 0)} · Parse errors: {b.get('parse_errors', 0)} · Quarantined lines: {b.get('line_quarantined', 0)}",
+            f"- Version: {b['version']['semver']} · Tag {b['version']['tag']} · Branch {b['version']['branch']}",
+            f"- Mapping source: {b.get('mapping', {}).get('source', 'unmapped')}",
+        ]
+        ap = b.get("approval")
+        if ap:
+            lines += [
+                f"- Approval: {ap['id']} · {ap['title']} · {ap['status']}",
+                f"- Owner approval: {'Yes' if ap.get('owner_approved') else 'No'}" + (f" at {ap.get('owner_approved_at')}" if ap.get("owner_approved_at") else ""),
+                f"- Fix IDs: {', '.join(ap.get('fix_ids') or []) or 'n/a'}",
+            ]
+        else:
+            lines.append("- Approval: not mapped")
+
+    lines += ["", "## Relevant Code Changes"]
+    for c in d["commits"]:
+        lines += ["", f"### {c['short']} {c['message']}", f"- Author: {c.get('author') or 'unknown'}", f"- Date: {c.get('date') or 'n/a'}", f"- URL: {c.get('url')}"]
+        for f in c.get("files", []):
+            lines += [f"- File: {f.get('path')} ({f.get('status')}, +{f.get('additions', 0)} / -{f.get('deletions', 0)})", f"  - URL: {f.get('url')}"]
+
+    out = "\n".join(lines)
+    return PlainTextResponse(out, media_type="text/markdown",
+                             headers={"Content-Disposition": "attachment; filename=hoe-change-evidence-report.md"})
 
 
 # ------------------------------------------------------------------ frontend

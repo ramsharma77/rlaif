@@ -19,7 +19,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-REPO = os.environ.get("HOE_GITHUB_REPO", "bhairavmehta/harness-optimization-engine")
+REPO = os.environ.get("HOE_GITHUB_REPO", "ramsharma77/rlaif")
 BASE = os.environ.get("HOE_GITHUB_BASE", "main")
 PATH = os.environ.get("HOE_GITHUB_PATH", "agents/{agent}")
 API = os.environ.get("HOE_GITHUB_API", "https://api.github.com").rstrip("/")
@@ -355,3 +355,86 @@ def _manual_commands(branch, title, commits):
         lines.append(f"git add {' '.join(files)} && git commit -m \"{message}\"")
     lines += [f"git push -u origin {branch}", f"gh pr create --base {BASE} --head {branch} --title \"{title}\" --body-file pr-body.md"]
     return "\n".join(lines)
+
+
+def ensure_release_refs(tag: str, branch: str):
+    """Create release branch and tag at current BASE head.
+
+    In dry-run mode returns planned refs only.
+    """
+    out = {"live": live(), "repo": REPO, "base": BASE, "tag": tag, "branch": branch,
+           "tag_exists": None, "branch_exists": None, "tag_created": False, "branch_created": False}
+    if not live():
+        out["note"] = "Dry run: set GITHUB_TOKEN to create branch and tag refs."
+        return out
+    base_ref = _call("GET", f"/repos/{REPO}/git/ref/heads/{urllib.parse.quote(BASE, safe='')}")
+    head_sha = base_ref["object"]["sha"]
+    out["head_sha"] = head_sha
+
+    q_branch = urllib.parse.quote(branch, safe="")
+    b_ref = _call("GET", f"/repos/{REPO}/git/ref/heads/{q_branch}", ok_missing=True)
+    out["branch_exists"] = bool(b_ref)
+    if not b_ref:
+        _call("POST", f"/repos/{REPO}/git/refs", {"ref": f"refs/heads/{branch}", "sha": head_sha})
+        out["branch_created"] = True
+
+    q_tag = urllib.parse.quote(tag, safe="")
+    t_ref = _call("GET", f"/repos/{REPO}/git/ref/tags/{q_tag}", ok_missing=True)
+    out["tag_exists"] = bool(t_ref)
+    if not t_ref:
+        _call("POST", f"/repos/{REPO}/git/refs", {"ref": f"refs/tags/{tag}", "sha": head_sha})
+        out["tag_created"] = True
+
+    return out
+
+
+def _patch_excerpt(patch: str, max_lines: int = 8) -> str:
+    if not patch:
+        return ""
+    out = []
+    for ln in patch.splitlines():
+        if ln.startswith("@@"):
+            continue
+        if ln.startswith("+++") or ln.startswith("---"):
+            continue
+        if ln.startswith("+") or ln.startswith("-"):
+            out.append(ln)
+        if len(out) >= max_lines:
+            break
+    return "\n".join(out)
+
+
+def change_evidence(limit_commits: int = 8, files_per_commit: int = 3):
+    """Recent commit evidence with relevant file snippets for UI review."""
+    commits = _get(f"/repos/{REPO}/commits?sha={urllib.parse.quote(BASE)}&per_page={max(1, min(limit_commits, 20))}", True) or []
+    out = []
+    for c in commits:
+        sha = c["sha"]
+        d = _get(f"/repos/{REPO}/commits/{sha}", True) or {}
+        files = d.get("files") or []
+        rel = [f for f in files if (f.get("filename") or "").startswith(("backend/", "frontend/", "agents/", "src/"))]
+        if not rel:
+            rel = files
+        rel.sort(key=lambda f: (f.get("changes") or 0), reverse=True)
+        picked = []
+        for f in rel[:max(1, files_per_commit)]:
+            path = f.get("filename") or ""
+            picked.append({
+                "path": path,
+                "status": f.get("status"),
+                "additions": f.get("additions", 0),
+                "deletions": f.get("deletions", 0),
+                "changes": f.get("changes", 0),
+                "url": file_url(path, sha),
+                "snippet": _patch_excerpt(f.get("patch") or ""),
+            })
+        out.append({
+            "sha": sha,
+            "short": sha[:7],
+            "message": (d.get("commit") or {}).get("message", "").split("\n")[0],
+            "author": ((d.get("author") or {}).get("login") or ((d.get("commit") or {}).get("author") or {}).get("name")),
+            "date": _ts(((d.get("commit") or {}).get("author") or {}).get("date")),
+            "url": commit_url(sha),
+            "files": picked,
+        })
+    return out
